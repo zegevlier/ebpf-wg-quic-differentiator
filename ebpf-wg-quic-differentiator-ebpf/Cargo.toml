@@ -1,0 +1,21 @@
+[package]
+name = "ebpf-wg-quic-differentiator-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+
+[dependencies]
+ebpf-wg-quic-differentiator-common = { path = "../ebpf-wg-quic-differentiator-common" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+network-types = "0.1.0"
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "ebpf-wg-quic-differentiator"
+path = "src/main.rs"
+
