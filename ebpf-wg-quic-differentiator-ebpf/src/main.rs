@@ -66,7 +66,18 @@ fn try_ebpf_wg_quic_differentiator(ctx: XdpContext) -> Result<u32, ()> {
             let udphdr: *const UdpHdr = ptr_at(&ctx, EthHdr::LEN + ip_hdr_len)?;
             let dst_port = unsafe { (*udphdr).dst_port() };
             let src_port = unsafe { (*udphdr).src_port() };
-            if dst_port == udp_port_quic || src_port == udp_port_wireguard {
+            if src_port == udp_port_wireguard {
+                info!(
+                    &ctx,
+                    "Found packet matching WG/QUIC ports ({}->{})", src_port, dst_port
+                );
+                // This is an outgoing WireGuard response packet, we rewrite the source port to the QUIC port
+                unsafe {
+                    (*udphdr.cast_mut()).set_src_port(udp_port_quic);
+                }
+                info!(&ctx, "Rewrote WG response packet to port {}", udp_port_quic);
+            }
+            if dst_port == udp_port_quic {
                 info!(
                     &ctx,
                     "Found packet matching WG/QUIC ports ({}->{})", src_port, dst_port
@@ -103,20 +114,11 @@ fn try_ebpf_wg_quic_differentiator(ctx: XdpContext) -> Result<u32, ()> {
                     && payload_bytes[3] == 0x00
                 {
                     info!(&ctx, "Identified WireGuard packet based on payload pattern");
-                    let udphdr_mut: *const UdpHdr = ptr_at(&ctx, EthHdr::LEN + ip_hdr_len)?;
-                    if dst_port == udp_port_quic {
-                        // This is an incoming WireGuard packet, we rewrite to the destination port to the WireGuard port
-                        unsafe {
-                            (*udphdr_mut.cast_mut()).set_dst_port(udp_port_wireguard);
-                        }
-                        info!(&ctx, "Rewrote WG packet to port {}", udp_port_wireguard);
-                    } else if src_port == udp_port_wireguard {
-                        // This is an outgoing WireGuard response packet, we rewrite the source port to the QUIC port
-                        unsafe {
-                            (*udphdr_mut.cast_mut()).set_src_port(udp_port_quic);
-                        }
-                        info!(&ctx, "Rewrote WG response packet to port {}", udp_port_quic);
+                    // This is an incoming WireGuard packet, we rewrite to the destination port to the WireGuard port
+                    unsafe {
+                        (*udphdr.cast_mut()).set_dst_port(udp_port_wireguard);
                     }
+                    info!(&ctx, "Rewrote WG packet to port {}", udp_port_wireguard);
                 } else {
                     info!(
                         &ctx,

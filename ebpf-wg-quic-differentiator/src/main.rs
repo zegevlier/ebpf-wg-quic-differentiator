@@ -7,11 +7,11 @@ use tokio::signal;
 
 #[derive(Debug, Parser)]
 struct Opt {
-    #[clap(short, long, default_value = "")]
+    #[clap(short, long, default_value = "lo")]
     iface: String,
     #[clap(short, long, default_value = "51820")]
     wg_port: u16,
-    #[clap(short, long, default_value = "443")]
+    #[clap(short, long, default_value = "8443")]
     quic_port: u16,
 }
 
