@@ -9,6 +9,7 @@ ebpf-wg-quic-differentiator-common = { path = "../ebpf-wg-quic-differentiator-co
 
 aya-ebpf = { workspace = true }
 aya-log-ebpf = { workspace = true }
+aya-ebpf-macros = { workspace = true }
 
 network-types = "0.1.0"
 

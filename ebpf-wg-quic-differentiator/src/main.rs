@@ -1,5 +1,5 @@
 use anyhow::Context as _;
-use aya::programs::{Xdp, XdpFlags};
+use aya::programs::{SchedClassifier, TcAttachType, Xdp, XdpFlags};
 use clap::Parser;
 #[rustfmt::skip]
 use log::{debug, warn};
@@ -19,7 +19,7 @@ struct Opt {
 async fn main() -> anyhow::Result<()> {
     let opt = Opt::parse();
 
-    env_logger::init();
+    env_logger::builder().filter_level(log::LevelFilter::Debug).init();
 
     // Bump the memlock rlimit. This is needed for older kernels that don't use the
     // new memcg based accounting, see https://lwn.net/Articles/837122/
@@ -68,13 +68,22 @@ async fn main() -> anyhow::Result<()> {
             });
         }
     }
-    let program: &mut Xdp = ebpf
-        .program_mut("ebpf_wg_quic_differentiator")
+
+    let _ = aya::programs::tc::qdisc_add_clsact(&iface);
+
+    let program_ingress: &mut SchedClassifier = ebpf
+        .program_mut("ebpf_wg_quic_differentiator_ingress")
         .unwrap()
         .try_into()?;
-    program.load()?;
-    program.attach(&iface, XdpFlags::default())
-        .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
+    program_ingress.load()?;
+    program_ingress.attach(&iface, TcAttachType::Ingress)?;
+
+    let program_egress: &mut SchedClassifier = ebpf
+        .program_mut("ebpf_wg_quic_differentiator_egress")
+        .unwrap()
+        .try_into()?;
+    program_egress.load()?;
+    program_egress.attach(&iface, TcAttachType::Egress)?;
 
     let ctrl_c = signal::ctrl_c();
     println!("Waiting for Ctrl-C...");

@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use aya_ebpf::{bindings::xdp_action, macros::xdp, programs::XdpContext};
+use aya_ebpf::{macros::classifier, programs::TcContext};
 use aya_log_ebpf::info;
 
 use core::mem;
@@ -17,28 +17,23 @@ static UDP_PORT_WIREGUARD: u16 = 51820;
 #[unsafe(no_mangle)]
 static UDP_PORT_QUIC: u16 = 443;
 
-#[xdp]
-pub fn ebpf_wg_quic_differentiator(ctx: XdpContext) -> u32 {
-    match try_ebpf_wg_quic_differentiator(ctx) {
+#[classifier]
+pub fn ebpf_wg_quic_differentiator_ingress(ctx: TcContext) -> i32 {
+    match unsafe { try_ebpf_wg_quic_differentiator_ingress(ctx) } {
         Ok(ret) => ret,
-        Err(_) => xdp_action::XDP_ABORTED,
+        Err(ret) => ret,
     }
 }
 
-#[inline(always)] // This function is taken directly from the aya examples
-fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
-    let start = ctx.data();
-    let end = ctx.data_end();
-    let len = mem::size_of::<T>();
-
-    if start + offset + len > end {
-        return Err(());
-    }
-
-    Ok((start + offset) as *const T)
+struct UdpPacketInfo {
+    udp_port_wireguard: u16,
+    udp_port_quic: u16,
+    ip_hdr_len: usize,
+    udp_hdr: UdpHdr,
 }
 
-fn try_ebpf_wg_quic_differentiator(ctx: XdpContext) -> Result<u32, ()> {
+#[inline(always)]
+unsafe fn parse_udp_packet(ctx: &TcContext) -> Result<Option<UdpPacketInfo>, i32> {
     // We need to read the configured ports from the global variables
     // We need the volatile read to prevent the compiler from optimizing
     // them away, not allowing us to read the overwritten values
@@ -46,91 +41,148 @@ fn try_ebpf_wg_quic_differentiator(ctx: XdpContext) -> Result<u32, ()> {
     let udp_port_wireguard = unsafe { core::ptr::read_volatile(&UDP_PORT_WIREGUARD) };
     let udp_port_quic = unsafe { core::ptr::read_volatile(&UDP_PORT_QUIC) };
 
-    let ethhdr: *const EthHdr = ptr_at(&ctx, 0)?;
-    // We look at both IPv4 and IPv6 packets.
-    let (protocol, ip_hdr_len) = match unsafe { (*ethhdr).ether_type() } {
-        Ok(EtherType::Ipv4) => {
-            let ipv4hdr: *const Ipv4Hdr = ptr_at(&ctx, EthHdr::LEN)?;
-            (unsafe { (*ipv4hdr).proto }, Ipv4Hdr::LEN)
+    let eth_hdr = ctx.load::<EthHdr>(0).map_err(|_| 0)?;
+    let ether_type = EtherType::try_from(eth_hdr.ether_type).map_err(|_| 0)?;
+    let ip_hdr_offset = mem::size_of::<EthHdr>();
+    let (protocol, ip_hdr_len) = match ether_type {
+        EtherType::Ipv4 => {
+            let ipv4_hdr = ctx.load::<Ipv4Hdr>(ip_hdr_offset).map_err(|_| 0)?;
+            (ipv4_hdr.proto, ip_hdr_offset + (ipv4_hdr.ihl() as usize))
         }
-        Ok(EtherType::Ipv6) => {
-            let ipv6hdr: *const Ipv6Hdr = ptr_at(&ctx, EthHdr::LEN)?;
-            (unsafe { (*ipv6hdr).next_hdr }, Ipv6Hdr::LEN)
+        EtherType::Ipv6 => {
+            let ipv6_hdr = ctx.load::<Ipv6Hdr>(ip_hdr_offset).map_err(|_| 0)?;
+            (ipv6_hdr.next_hdr, ip_hdr_offset + mem::size_of::<Ipv6Hdr>())
         }
-        _ => return Ok(xdp_action::XDP_PASS),
+        _ => return Ok(None),
     };
 
-    match protocol {
-        IpProto::Tcp => {}
-        IpProto::Udp => {
-            let udphdr: *const UdpHdr = ptr_at(&ctx, EthHdr::LEN + ip_hdr_len)?;
-            let dst_port = unsafe { (*udphdr).dst_port() };
-            let src_port = unsafe { (*udphdr).src_port() };
-            if src_port == udp_port_wireguard {
-                info!(
-                    &ctx,
-                    "Found packet matching WG/QUIC ports ({}->{})", src_port, dst_port
-                );
-                // This is an outgoing WireGuard response packet, we rewrite the source port to the QUIC port
-                unsafe {
-                    (*udphdr.cast_mut()).set_src_port(udp_port_quic);
-                }
-                info!(&ctx, "Rewrote WG response packet to port {}", udp_port_quic);
-            }
-            if dst_port == udp_port_quic {
-                info!(
-                    &ctx,
-                    "Found packet matching WG/QUIC ports ({}->{})", src_port, dst_port
-                );
-                // Now, we extract the first 4 bytes of the UDP payload
-                // These bytes will help us differentiate WireGuard from QUIC
-                // But only if we have enough data
-                if (ctx.data_end() - ctx.data()) < (EthHdr::LEN + ip_hdr_len + UdpHdr::LEN + 4) {
-                    info!(
-                        &ctx,
-                        "Packet too short to read UDP payload, passing through"
-                    );
-                    return Ok(xdp_action::XDP_PASS);
-                }
-                let udp_payload_offset = EthHdr::LEN + ip_hdr_len + UdpHdr::LEN;
-                let udp_payload: *const [u8; 4] = ptr_at(&ctx, udp_payload_offset)?;
-                let payload_bytes = unsafe { *udp_payload };
-                // Print the packet content for debugging
-                info!(
-                    &ctx,
-                    "UDP Payload Bytes [{}->{}]: {:x} {:x} {:x} {:x}",
-                    src_port,
-                    dst_port,
-                    payload_bytes[0],
-                    payload_bytes[1],
-                    payload_bytes[2],
-                    payload_bytes[3]
-                );
+    if protocol != IpProto::Udp {
+        info!(
+            ctx,
+            "Not a UDP packet (protocol: {}), skipping", protocol as u8
+        );
+        return Ok(None);
+    }
 
-                // Now, we check if it matches the WireGuard pattern
-                if (payload_bytes[0] >= 0x01 && payload_bytes[0] <= 0x04)
-                    && payload_bytes[1] == 0x00
-                    && payload_bytes[2] == 0x00
-                    && payload_bytes[3] == 0x00
-                {
-                    info!(&ctx, "Identified WireGuard packet based on payload pattern");
-                    // This is an incoming WireGuard packet, we rewrite to the destination port to the WireGuard port
-                    unsafe {
-                        (*udphdr.cast_mut()).set_dst_port(udp_port_wireguard);
-                    }
-                    info!(&ctx, "Rewrote WG packet to port {}", udp_port_wireguard);
-                } else {
-                    info!(
-                        &ctx,
-                        "Packet does not match WireGuard payload pattern, passing through"
-                    );
-                }
-            }
-        }
-        _ => {}
+    let udp_hdr = ctx.load::<UdpHdr>(ip_hdr_len).map_err(|_| 0)?;
+
+    let dest_port = udp_hdr.dst_port();
+    let src_port = udp_hdr.src_port();
+    info!(ctx, "UDP Packet [{}->{}]", src_port, dest_port,);
+
+    Ok(Some(UdpPacketInfo {
+        udp_port_wireguard,
+        udp_port_quic,
+        ip_hdr_len,
+        udp_hdr,
+    }))
+}
+
+unsafe fn try_ebpf_wg_quic_differentiator_ingress(mut ctx: TcContext) -> Result<i32, i32> {
+    info!(
+        &ctx,
+        "ebpf_wg_quic_differentiator_ingress received a packet"
+    );
+
+    let info = match unsafe { parse_udp_packet(&ctx) }? {
+        Some(info) => info,
+        None => return Ok(0),
     };
 
-    Ok(xdp_action::XDP_PASS)
+    let dest_port = info.udp_hdr.dst_port();
+    let src_port = info.udp_hdr.src_port();
+
+    if dest_port == info.udp_port_quic {
+        info!(
+            &ctx,
+            "Packet match QUIC/WG port: {}", info.udp_port_wireguard
+        );
+        // Now, we extract the first 4 bytes of the UDP payload
+        // These bytes will help us differentiate WireGuard from QUIC
+        // But only if we have enough data
+        let payload_offset = info.ip_hdr_len + mem::size_of::<UdpHdr>();
+        let payload_len = info.udp_hdr.len() as usize - mem::size_of::<UdpHdr>();
+        if payload_len < 4 {
+            info!(
+                &ctx,
+                "Not enough payload data to differentiate, treating as QUIC"
+            );
+            return Ok(0);
+        }
+        let first_4_bytes = ctx.load::<[u8; 4]>(payload_offset).map_err(|_| 0)?;
+
+        info!(
+            &ctx,
+            "UDP Payload Bytes [{}->{}]: {:x} {:x} {:x} {:x}",
+            src_port,
+            dest_port,
+            first_4_bytes[0],
+            first_4_bytes[1],
+            first_4_bytes[2],
+            first_4_bytes[3]
+        );
+
+        // Now, we check if it matches the WireGuard header structure
+        if (first_4_bytes[0] >= 0x01 && first_4_bytes[0] <= 0x04)
+            && first_4_bytes[1] == 0x00
+            && first_4_bytes[2] == 0x00
+            && first_4_bytes[3] == 0x00
+        {
+            info!(
+                &ctx,
+                "Packet matches WireGuard header structure, treating as WireGuard"
+            );
+            let mut udp_hdr = info.udp_hdr;
+            // We re-write the destination port to the WireGuard port, so that it gets processed by the WireGuard kernel module
+            udp_hdr.set_dst_port(info.udp_port_wireguard);
+
+            // We need to write back the modified UDP header to the packet
+            ctx.store(info.ip_hdr_len, &udp_hdr, 0).map_err(|_| 0)?;
+        } else {
+            info!(
+                &ctx,
+                "Packet does not match WireGuard header structure, treating as QUIC"
+            );
+            // We don't do anything to the packet, just let it pass as QUIC
+        }
+    }
+
+    Ok(0)
+}
+
+#[classifier]
+pub fn ebpf_wg_quic_differentiator_egress(ctx: TcContext) -> i32 {
+    match unsafe { try_ebpf_wg_quic_differentiator_egress(ctx) } {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+unsafe fn try_ebpf_wg_quic_differentiator_egress(mut ctx: TcContext) -> Result<i32, i32> {
+    info!(&ctx, "ebpf_wg_quic_differentiator_egress received a packet");
+
+    let info = match unsafe { parse_udp_packet(&ctx)? } {
+        Some(info) => info,
+        None => return Ok(0),
+    };
+
+    let src_port = info.udp_hdr.src_port();
+    if src_port == info.udp_port_wireguard {
+        // We re-write the outgoing source port to the QUIC port, so that it comes back in the ingress path with the QUIC port, allowing us to differentiate it from WireGuard responses
+        info!(
+            &ctx,
+            "Outgoing packet from WireGuard port {}, rewriting source port to QUIC port {}",
+            info.udp_port_wireguard,
+            info.udp_port_quic
+        );
+        let mut udp_hdr = info.udp_hdr;
+        udp_hdr.set_src_port(info.udp_port_quic);
+
+        // We need to write back the modified UDP header to the packet
+        ctx.store(info.ip_hdr_len, &udp_hdr, 0).map_err(|_| 0)?;
+    }
+
+    Ok(0)
 }
 
 #[cfg(not(test))]
