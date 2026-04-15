@@ -134,7 +134,9 @@ unsafe fn try_ebpf_wg_quic_differentiator_ingress(mut ctx: TcContext) -> Result<
             );
             let mut udp_hdr = info.udp_hdr;
             // We re-write the destination port to the WireGuard port, so that it gets processed by the WireGuard kernel module
+            // Ensure checksum is 0 for UDP over IPv4 to let the network stack ignore it or recompute it if needed, or rely on hardware offload
             udp_hdr.set_dst_port(info.udp_port_wireguard);
+            udp_hdr.check = [0, 0]; // Fix invalid checksum after rewriting port
 
             // We need to write back the modified UDP header to the packet
             ctx.store(info.ip_hdr_len, &udp_hdr, 0).map_err(|_| 0)?;
@@ -177,6 +179,7 @@ unsafe fn try_ebpf_wg_quic_differentiator_egress(mut ctx: TcContext) -> Result<i
         );
         let mut udp_hdr = info.udp_hdr;
         udp_hdr.set_src_port(info.udp_port_quic);
+        udp_hdr.check = [0, 0]; // Clear checksum so the host auto-recomputes or ignores it over veth
 
         // We need to write back the modified UDP header to the packet
         ctx.store(info.ip_hdr_len, &udp_hdr, 0).map_err(|_| 0)?;
